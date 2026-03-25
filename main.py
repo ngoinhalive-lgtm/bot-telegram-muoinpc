@@ -10,8 +10,8 @@ TOKEN = '8700047218:AAHINxefZHAm_fGMEd3sPJMilNtYH36oSy0'
 CHAT_ID = '7366887130'
 
 # --- Thông số Cụm nến Inside Bar ---
-MOTHER_BAR_BODY_PCT = 2.5  # Thân nến chủ phải dài ít nhất 2.5% (Thể hiện nến đà mạnh)
-VOL_MULTIPLIER = 1.2       # Nến con hiện tại có Volume cao hơn nến con trước ít nhất 1.2 lần (trội hơn một tý)
+MOTHER_BAR_BODY_PCT = 2.5  
+VOL_MULTIPLIER = 1.5       # Đã tăng lên 1.5 theo yêu cầu của bạn
 
 # ==========================================
 # PHẦN 2: TRẠM PHÁT SÓNG CHỐNG NGỦ GẬT
@@ -28,6 +28,9 @@ def keep_alive():
 # ==========================================
 # PHẦN 3: XỬ LÝ DỮ LIỆU SÀN FUTURES
 # ==========================================
+# Thêm bộ nhớ để bot không báo trùng 1 tín hiệu nhiều lần
+alerted_candles = {}
+
 def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
@@ -37,7 +40,6 @@ def send_telegram_message(message):
         pass
 
 def get_futures_pairs():
-    """Lấy danh sách các cặp USDT Futures đang giao dịch"""
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     try:
         res = requests.get(url).json()
@@ -46,25 +48,27 @@ def get_futures_pairs():
         return []
 
 def get_all_24h_volumes():
-    """Lấy Volume 24h của TẤT CẢ đồng coin chỉ bằng 1 lần gọi (Tối ưu tốc độ)"""
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     try:
         res = requests.get(url).json()
-        # Lưu dưới dạng { 'BTCUSDT': 150000000.5, ... } (Tính bằng USD)
         return {item['symbol']: float(item['quoteVolume']) for item in res}
     except Exception:
         return {}
 
 def check_inside_bar_pattern(symbol):
-    """Săn tìm cụm nến nén khung 4H"""
-    # Lấy 10 cây nến 4H gần nhất
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=4h&limit=10"
+    # Lấy 11 nến để có đủ dữ liệu lùi lại 1 nhịp
+    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=4h&limit=11"
     try:
         res = requests.get(url).json()
-        if len(res) < 4: return None
+        if len(res) < 5: return None
         
-        # Lùi về quá khứ để tìm Nến Chủ (từ nến -3 đến -9)
-        for mb_idx in range(-3, -10, -1):
+        # --- ĐIỀU KIỆN MỚI: Chỉ lấy nến ĐÃ ĐÓNG CỬA ---
+        # res[-1] là nến đang chạy.
+        # res[-2] là nến 4H vừa mới đóng cửa hoàn toàn.
+        last_closed_idx = -2
+        
+        # Lùi về quá khứ để tìm Nến Chủ (từ nến -4 đến -11)
+        for mb_idx in range(-4, -11, -1):
             mb = res[mb_idx]
             mb_open = float(mb[1])
             mb_close = float(mb[4])
@@ -74,13 +78,13 @@ def check_inside_bar_pattern(symbol):
             # 1. Kiểm tra xem Nến Chủ có đủ mạnh không
             mb_body_pct = ((mb_body_high - mb_body_low) / mb_body_low) * 100
             if mb_body_pct < MOTHER_BAR_BODY_PCT:
-                continue # Nến yếu quá, bỏ qua tìm nến khác
+                continue 
                 
             is_valid_inside = True
             inside_vols = []
             
-            # 2. Kiểm tra các nến con sau Nến Chủ xem có nằm trọn trong thân không
-            for i in range(mb_idx + 1, 0): # Chạy từ nến con đầu tiên đến nến hiện tại (-1)
+            # 2. Kiểm tra các nến con (từ sau Nến Chủ đến nến VỪA ĐÓNG CỬA)
+            for i in range(mb_idx + 1, last_closed_idx + 1): 
                 ib = res[i]
                 ib_open = float(ib[1])
                 ib_close = float(ib[4])
@@ -92,24 +96,33 @@ def check_inside_bar_pattern(symbol):
                     is_valid_inside = False
                     break
                 
-                # Lưu lại Volume của các nến con CŨ (không tính nến hiện tại đang chạy)
-                if i != -1: 
+                # Lưu lại Volume của các nến con CŨ (không tính nến đóng cửa gần nhất)
+                if i != last_closed_idx: 
                     inside_vols.append(float(ib[5]))
 
-            # 3. Nếu cấu trúc nến đúng chuẩn và có ít nhất 1 nến con cũ để so sánh
+            # 3. Nếu cấu trúc nến đúng chuẩn
             if is_valid_inside and len(inside_vols) >= 1:
-                current_candle = res[-1]
+                current_candle = res[last_closed_idx] # Nến vừa đóng cửa
                 current_vol = float(current_candle[5])
                 current_close = float(current_candle[4])
+                current_open_time = current_candle[0] # Thời gian mở nến để làm ID
                 
                 max_prev_vol = max(inside_vols)
                 
-                # 4. Kiểm tra Volume nến con hiện tại có "trội" hơn các nến con trước không
+                # 4. Kiểm tra Volume trội hơn 1.5 lần
                 if max_prev_vol > 0 and current_vol >= (max_prev_vol * VOL_MULTIPLIER):
+                    
+                    # KIỂM TRA CHỐNG SPAM: Nếu nến này đã báo rồi thì bỏ qua
+                    if alerted_candles.get(symbol) == current_open_time:
+                        return None 
+                        
+                    # Nếu chưa báo thì lưu vào "sổ tay" và trả kết quả
+                    alerted_candles[symbol] = current_open_time
+                    
                     return {
                         "price": current_close,
                         "mb_pct": mb_body_pct,
-                        "inside_count": abs(mb_idx) - 1, # Tổng số nến con
+                        "inside_count": abs(mb_idx) - 2, 
                         "ratio": current_vol / max_prev_vol
                     }
         return None
@@ -117,11 +130,11 @@ def check_inside_bar_pattern(symbol):
         return None
 
 def run_bot():
-    print("🤖 Đang khởi động Bot Sniper Futures 4H...")
-    send_telegram_message("✅ <b>Bot Futures 4H</b> đã kích hoạt! Sẵn sàng săn nến Inside Bar...")
+    print("🤖 Đang khởi động Bot Sniper Futures 4H (Bản Fix Spam)...")
+    send_telegram_message("✅ <b>Bot Futures 4H</b> đã kích hoạt! Chỉ bắt tín hiệu khi nến đã đóng hoàn toàn.")
     while True:
         symbols = get_futures_pairs()
-        volumes_24h = get_all_24h_volumes() # Kéo volume 24h của cả sàn về
+        volumes_24h = get_all_24h_volumes() 
         
         for symbol in symbols:
             result = check_inside_bar_pattern(symbol)
@@ -129,18 +142,19 @@ def run_bot():
                 vol_24h = volumes_24h.get(symbol, 0)
                 
                 msg = (f"🎯 <b>CỤM NẾN NÉN FUTURES (4H): {symbol}</b>\n"
-                       f"💰 Giá hiện tại: {result['price']} $\n"
+                       f"💰 Giá đóng cửa: {result['price']} $\n"
                        f"📈 Nến chủ: Thân dài <b>{result['mb_pct']:.1f}%</b>\n"
                        f"🗜️ Cấu trúc: Có <b>{result['inside_count']} nến con</b> nằm trọn trong thân\n"
-                       f"🔥 Volume nến cuối: Trội hơn <b>{result['ratio']:.1f} lần</b> nến trước\n"
+                       f"🔥 Volume nến Break: Trội hơn <b>{result['ratio']:.1f} lần</b> nến trước\n"
                        f"💵 Thanh khoản 24h: <b>{vol_24h / 1000000:.1f} Triệu $</b>\n"
                        f"👉 <a href='https://www.binance.com/en/futures/{symbol}'>Mở biểu đồ Futures</a>")
                 send_telegram_message(msg)
             
-            time.sleep(0.1) # Tránh bị sàn chặn API
+            time.sleep(0.1)
             
-        print("Đã quét xong 1 vòng Futures. Nghỉ ngơi...")
-        time.sleep(300) # Chu kỳ quét 5 phút một lần để check nến 4H
+        print("Đã quét xong. Đang chờ...")
+        # Vì đã chống spam, có thể rút ngắn thời gian quét xuống 1 phút (60s) để báo tin nhanh hơn ngay sau khi nến đóng
+        time.sleep(60) 
 
 # ==========================================
 # KÍCH HOẠT HỆ THỐNG
