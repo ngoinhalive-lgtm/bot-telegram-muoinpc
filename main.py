@@ -1,163 +1,147 @@
+import ccxt
+import pandas as pd
 import requests
 import time
-import threading
+import logging
+import os
+from datetime import datetime
 from flask import Flask
+from threading import Thread
 
 # ==========================================
-# PHẦN 1: CÀI ĐẶT THÔNG SỐ CHIẾN THUẬT FUTURES
+# CẤU HÌNH BOT (Gộp từ config.py)
 # ==========================================
-TOKEN = '8700047218:AAHINxefZHAm_fGMEd3sPJMilNtYH36oSy0'
-CHAT_ID = '7366887130'
+TELEGRAM_TOKEN = "8700047218:AAHINxefZHAm_fGMEd3sPJMilNtYH36oSy0"
+TELEGRAM_CHAT_ID = "7366887130"
 
-# --- Thông số Cụm nến Inside Bar ---
-MOTHER_BAR_BODY_PCT = 2.5  
-VOL_MULTIPLIER = 1.5       # Đã tăng lên 1.5 theo yêu cầu của bạn
+TIMEFRAME = '4h'
+SLEEP_INTERVAL = 3600
+COOLDOWN_TIME = 86400
+
+RSI_PERIOD = 14
+RSI_MIN = 50
+RSI_MAX = 75
+
+EMA_PERIOD = 20
+VOL_SMA_PERIOD = 20
+VOL_RATIO_MIN = 3
+MIN_24H_QUOTE_VOL = 500000
+SWING_WINDOW = 2
 
 # ==========================================
-# PHẦN 2: TRẠM PHÁT SÓNG CHỐNG NGỦ GẬT
+# THIẾT LẬP LOGGING & FLASK (Dành cho Render)
 # ==========================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 app = Flask(__name__)
 
 @app.route('/')
-def home():
-    return "Bot Sniper Futures 4H đang chạy 24/7!"
-
 def keep_alive():
-    app.run(host='0.0.0.0', port=8080)
+    return "Bot Trading đang hoạt động ổn định trên Render!"
+
+def run_web_server():
+    # Render sẽ tự động cấp phát PORT thông qua biến môi trường
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 # ==========================================
-# PHẦN 3: XỬ LÝ DỮ LIỆU SÀN FUTURES
+# LOGIC BOT TRADING
 # ==========================================
-# Thêm bộ nhớ để bot không báo trùng 1 tín hiệu nhiều lần
-alerted_candles = {}
-
 def send_telegram_message(message):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"}
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         requests.post(url, json=payload)
-    except Exception:
-        pass
+    except Exception as e:
+        logging.error(f"Lỗi gửi Telegram: {e}")
 
-def get_futures_pairs():
-    url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-    try:
-        res = requests.get(url).json()
-        return [s['symbol'] for s in res['symbols'] if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL' and s['status'] == 'TRADING']
-    except Exception:
-        return []
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-def get_all_24h_volumes():
-    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
-    try:
-        res = requests.get(url).json()
-        return {item['symbol']: float(item['quoteVolume']) for item in res}
-    except Exception:
-        return {}
+def check_higher_low(df, window=SWING_WINDOW):
+    if len(df) < window * 2 + 1: return False
+    lows = []
+    for i in range(window, len(df) - window):
+        is_swing_low = True
+        current_low = df['low'].iloc[i]
+        for j in range(1, window + 1):
+            if current_low >= df['low'].iloc[i-j] or current_low >= df['low'].iloc[i+j]:
+                is_swing_low = False
+                break
+        if is_swing_low: lows.append(current_low)
+    if len(lows) >= 2: return lows[-1] > lows[-2]
+    return False
 
-def check_inside_bar_pattern(symbol):
-    # Lấy 11 nến để có đủ dữ liệu lùi lại 1 nhịp
-    url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=4h&limit=11"
+def analyze_pair(exchange, symbol, alerted_pairs):
     try:
-        res = requests.get(url).json()
-        if len(res) < 5: return None
-        
-        # --- ĐIỀU KIỆN MỚI: Chỉ lấy nến ĐÃ ĐÓNG CỬA ---
-        # res[-1] là nến đang chạy.
-        # res[-2] là nến 4H vừa mới đóng cửa hoàn toàn.
-        last_closed_idx = -2
-        
-        # Lùi về quá khứ để tìm Nến Chủ (từ nến -4 đến -11)
-        for mb_idx in range(-4, -11, -1):
-            mb = res[mb_idx]
-            mb_open = float(mb[1])
-            mb_close = float(mb[4])
-            mb_body_high = max(mb_open, mb_close)
-            mb_body_low = min(mb_open, mb_close)
+        ticker = exchange.fetch_ticker(symbol)
+        if ticker.get('quoteVolume', 0) < MIN_24H_QUOTE_VOL: return None
             
-            # 1. Kiểm tra xem Nến Chủ có đủ mạnh không
-            mb_body_pct = ((mb_body_high - mb_body_low) / mb_body_low) * 100
-            if mb_body_pct < MOTHER_BAR_BODY_PCT:
-                continue 
-                
-            is_valid_inside = True
-            inside_vols = []
+        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=100)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        if len(df) < 50: return None
             
-            # 2. Kiểm tra các nến con (từ sau Nến Chủ đến nến VỪA ĐÓNG CỬA)
-            for i in range(mb_idx + 1, last_closed_idx + 1): 
-                ib = res[i]
-                ib_open = float(ib[1])
-                ib_close = float(ib[4])
-                ib_body_high = max(ib_open, ib_close)
-                ib_body_low = min(ib_open, ib_close)
-                
-                # Thân nến con phải nằm trọn trong High/Low của thân Nến Chủ (Râu tự do)
-                if ib_body_high > mb_body_high or ib_body_low < mb_body_low:
-                    is_valid_inside = False
-                    break
-                
-                # Lưu lại Volume của các nến con CŨ (không tính nến đóng cửa gần nhất)
-                if i != last_closed_idx: 
-                    inside_vols.append(float(ib[5]))
+        df['ema20'] = df['close'].ewm(span=EMA_PERIOD, adjust=False).mean()
+        df['rsi14'] = calculate_rsi(df['close'], period=RSI_PERIOD)
+        df['vol_sma20'] = df['volume'].rolling(window=VOL_SMA_PERIOD).mean()
+        
+        idx = -2 
+        current_close = df['close'].iloc[idx]
+        current_ema20 = df['ema20'].iloc[idx]
+        current_rsi = df['rsi14'].iloc[idx]
+        current_vol = df['volume'].iloc[idx]
+        current_vol_sma = df['vol_sma20'].iloc[idx]
+        
+        if pd.isna(current_vol_sma) or current_vol_sma == 0: return None
+        vol_ratio = current_vol / current_vol_sma
+        
+        if (current_close > current_ema20) and (RSI_MIN <= current_rsi <= RSI_MAX) and (vol_ratio > VOL_RATIO_MIN) and check_higher_low(df):
+            clean_symbol = symbol.split(':')[0].replace('/', '')
+            tv_link = f"https://www.tradingview.com/chart/?symbol=BINANCE:{clean_symbol}.P"
+            return (f"🚨 <b>TÍN HIỆU FUTURES: {clean_symbol}</b>\n\n"
+                    f"💰 <b>Giá:</b> {current_close}\n"
+                    f"📊 <b>RSI (4h):</b> {current_rsi:.2f}\n"
+                    f"📈 <b>Volume Ratio:</b> {vol_ratio:.2f}x (SMA20)\n\n"
+                    f"🔗 <a href='{tv_link}'>Mở biểu đồ TradingView</a>")
+    except Exception as e:
+        logging.warning(f"Lỗi phân tích {symbol}: {e}")
+    return None
 
-            # 3. Nếu cấu trúc nến đúng chuẩn
-            if is_valid_inside and len(inside_vols) >= 1:
-                current_candle = res[last_closed_idx] # Nến vừa đóng cửa
-                current_vol = float(current_candle[5])
-                current_close = float(current_candle[4])
-                current_open_time = current_candle[0] # Thời gian mở nến để làm ID
-                
-                max_prev_vol = max(inside_vols)
-                
-                # 4. Kiểm tra Volume trội hơn 1.5 lần
-                if max_prev_vol > 0 and current_vol >= (max_prev_vol * VOL_MULTIPLIER):
-                    
-                    # KIỂM TRA CHỐNG SPAM: Nếu nến này đã báo rồi thì bỏ qua
-                    if alerted_candles.get(symbol) == current_open_time:
-                        return None 
-                        
-                    # Nếu chưa báo thì lưu vào "sổ tay" và trả kết quả
-                    alerted_candles[symbol] = current_open_time
-                    
-                    return {
-                        "price": current_close,
-                        "mb_pct": mb_body_pct,
-                        "inside_count": abs(mb_idx) - 2, 
-                        "ratio": current_vol / max_prev_vol
-                    }
-        return None
-    except Exception:
-        return None
-
-def run_bot():
-    print("🤖 Đang khởi động Bot Sniper Futures 4H (Bản Fix Spam)...")
-    send_telegram_message("✅ <b>Bot Futures 4H</b> đã kích hoạt! Chỉ bắt tín hiệu khi nến đã đóng hoàn toàn.")
+def bot_loop():
+    logging.info("Khởi động luồng Bot Trading...")
+    exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
+    alerted_pairs = {}
+    
     while True:
-        symbols = get_futures_pairs()
-        volumes_24h = get_all_24h_volumes() 
-        
-        for symbol in symbols:
-            result = check_inside_bar_pattern(symbol)
-            if result:
-                vol_24h = volumes_24h.get(symbol, 0)
+        try:
+            exchange.load_markets()
+            symbols = [sym for sym in exchange.symbols if exchange.markets[sym]['linear'] and exchange.markets[sym]['quote'] == 'USDT']
+            current_time = time.time()
+            
+            for symbol in symbols:
+                if symbol in alerted_pairs and (current_time - alerted_pairs[symbol]) < COOLDOWN_TIME:
+                    continue
+                alert_msg = analyze_pair(exchange, symbol, alerted_pairs)
+                if alert_msg:
+                    send_telegram_message(alert_msg)
+                    alerted_pairs[symbol] = current_time
+                time.sleep(0.1)
                 
-                msg = (f"🎯 <b>CỤM NẾN NÉN FUTURES (4H): {symbol}</b>\n"
-                       f"💰 Giá đóng cửa: {result['price']} $\n"
-                       f"📈 Nến chủ: Thân dài <b>{result['mb_pct']:.1f}%</b>\n"
-                       f"🗜️ Cấu trúc: Có <b>{result['inside_count']} nến con</b> nằm trọn trong thân\n"
-                       f"🔥 Volume nến Break: Trội hơn <b>{result['ratio']:.1f} lần</b> nến trước\n"
-                       f"💵 Thanh khoản 24h: <b>{vol_24h / 1000000:.1f} Triệu $</b>\n"
-                       f"👉 <a href='https://www.binance.com/en/futures/{symbol}'>Mở biểu đồ Futures</a>")
-                send_telegram_message(msg)
-            
-            time.sleep(0.1)
-            
-        print("Đã quét xong. Đang chờ...")
-        # Vì đã chống spam, có thể rút ngắn thời gian quét xuống 1 phút (60s) để báo tin nhanh hơn ngay sau khi nến đóng
-        time.sleep(60) 
+            logging.info(f"Hoàn thành quét. Đợi {SLEEP_INTERVAL} giây...")
+            time.sleep(SLEEP_INTERVAL)
+        except Exception as e:
+            logging.error(f"Lỗi vòng lặp bot: {e}. Thử lại sau 60s...")
+            time.sleep(60)
 
-# ==========================================
-# KÍCH HOẠT HỆ THỐNG
-# ==========================================
-threading.Thread(target=keep_alive).start()
-run_bot()
+if __name__ == '__main__':
+    # Chạy Web Server trên một luồng (thread) riêng để không chặn vòng lặp của bot
+    web_thread = Thread(target=run_web_server)
+    web_thread.start()
+    
+    # Chạy logic bot ở luồng chính
+    bot_loop()
