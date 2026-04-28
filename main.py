@@ -5,14 +5,31 @@ import pandas as pd
 import schedule
 from datetime import datetime
 import yfinance as yf
+from flask import Flask
+from threading import Thread
 
 # ==========================================
-# CẤU HÌNH THÔNG SỐ BẢO MẬT (Lấy từ Environment Variables)
+# CẤU HÌNH THÔNG SỐ BẢO MẬT (Lấy từ Environment Variables của Render)
 # ==========================================
-# Điền Token và Chat ID của bạn vào đây nếu chạy trên máy tính, 
-# hoặc cấu hình biến môi trường nếu chạy trên Render.
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8700047218:AAHINxefZHAm_fGMEd3sPJMilNtYH36oSy0")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7366887130")
+
+# ==========================================
+# CẤU HÌNH MÁY CHỦ WEB MINI (ĐỂ RENDER KHÔNG BÁO LỖI TIMEOUT)
+# ==========================================
+app = Flask(__name__)
+
+@app.route('/')
+def keep_alive():
+    return "Bot WickZone đang hoạt động tốt 24/7!"
+
+def run_server():
+    port = int(os.environ.get('PORT', 10000))
+    # Chạy Flask server tắt cảnh báo log để giao diện console sạch sẽ
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    app.run(host='0.0.0.0', port=port)
 
 # ==========================================
 # CẤU HÌNH CHIẾN LƯỢC BOT
@@ -69,10 +86,8 @@ def get_yfinance_klines(symbol, timeframe, limit=250):
         ticker = yf.Ticker(symbol)
         
         if timeframe == "M15":
-            # Lấy nến 15m (Yahoo hỗ trợ tối đa 60 ngày cho khung này)
             df = ticker.history(interval="15m", period="60d")
         else: # timeframe == "H4"
-            # Lấy nến 1H và gộp thành nến 4H (Resampling)
             df = ticker.history(interval="1h", period="730d") 
             df = df.resample('4h').agg({
                 'Open': 'first',
@@ -84,15 +99,11 @@ def get_yfinance_klines(symbol, timeframe, limit=250):
         if df.empty: return pd.DataFrame()
         
         df = df.tail(limit).reset_index()
-        
-        # Đổi tên cột cho đồng bộ với Binance
         time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
         df.rename(columns={time_col: 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}, inplace=True)
         
         df = df[['time', 'open', 'high', 'low', 'close']]
         df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].astype(float)
-        
-        # Chuyển đổi Datetime của Yahoo sang msec (timestamp) giống Binance để tạo ID đồng nhất
         df['time'] = df['time'].apply(lambda x: x.timestamp() * 1000)
         
         return df
@@ -101,7 +112,7 @@ def get_yfinance_klines(symbol, timeframe, limit=250):
         return pd.DataFrame()
 
 # ==========================================
-# 2. LOGIC TÌM VÙNG & TÍN HIỆU (Core Strategy)
+# 2. LOGIC TÌM VÙNG & TÍN HIỆU
 # ==========================================
 def calculate_wick_score(row, zone_type):
     high, low, o, c = row['high'], row['low'], row['open'], row['close']
@@ -130,7 +141,6 @@ def scan_h4_zones(df_h4):
     
     last_close = df_h4.iloc[-1]['close']
     
-    # Tìm Fractal H4
     for i in range(2, len(df_h4)-2):
         row = df_h4.iloc[i]
         
@@ -158,7 +168,6 @@ def scan_h4_zones(df_h4):
                     'distal': row['low'], 'proximal': row['close'], 'score': int(score)
                 })
                 
-    # Xóa bỏ các vùng đã bị nến thủng (Invalidated Zones)
     valid_zones = []
     for z in zones:
         if z['type'] == 'Supply' and last_close > z['distal']: continue
@@ -168,7 +177,6 @@ def scan_h4_zones(df_h4):
     return valid_zones
 
 def check_m15_reversal(df_m15, zone_type):
-    # c1 = Nến vừa đóng cửa xong, c2 = Nến trước đó
     c1 = df_m15.iloc[-1] 
     c2 = df_m15.iloc[-2] 
     
@@ -181,14 +189,12 @@ def check_m15_reversal(df_m15, zone_type):
     if total_size1 <= 0: return False
     
     if zone_type == 'Demand':
-        # Mua lên
         if body_size1 > 0 and lower_wick1 > body_size1 * PINBAR_RATIO: return True
         if lower_wick1 / total_size1 > REJECT_RATIO: return True
         if (c2['close'] < c2['open'] and c1['close'] > c1['open'] and 
             c1['close'] > c2['open'] and c1['open'] <= c2['close']): return True
             
     elif zone_type == 'Supply':
-        # Bán xuống
         if body_size1 > 0 and upper_wick1 > body_size1 * PINBAR_RATIO: return True
         if upper_wick1 / total_size1 > REJECT_RATIO: return True
         if (c2['close'] > c2['open'] and c1['close'] < c1['open'] and 
@@ -201,7 +207,6 @@ def check_m15_reversal(df_m15, zone_type):
 # ==========================================
 def process_symbol(symbol, market_type):
     try:
-        # 1. Fetch Dữ liệu dựa theo loại thị trường
         if market_type == "CRYPTO":
             df_h4 = get_binance_klines(symbol, "4h", 250)
             df_m15 = get_binance_klines(symbol, "15m", 15)
@@ -211,11 +216,9 @@ def process_symbol(symbol, market_type):
             
         if df_h4.empty or df_m15.empty: return
 
-        # 2. Tìm vùng H4
         zones = scan_h4_zones(df_h4)
         if not zones: return
         
-        # 3. Quét tín hiệu M15
         last_m15 = df_m15.iloc[-1]
         close1 = last_m15['close']
         time1 = last_m15['time'] 
@@ -232,7 +235,7 @@ def process_symbol(symbol, market_type):
             if price_in_zone or touched_recently:
                 if check_m15_reversal(df_m15, z['type']):
                     action = "🟢 MUA (LONG)" if z['type'] == 'Demand' else "🔴 BÁN (SHORT)"
-                    clean_symbol = symbol.replace("=X", "") # Xóa =X của Yahoo cho đẹp
+                    clean_symbol = symbol.replace("=X", "") 
                     
                     msg = (
                         f"🚨 <b>TÍN HIỆU {market_type}</b>\n\n"
@@ -250,18 +253,16 @@ def process_symbol(symbol, market_type):
                     if len(alerted_signals) > 1000: alerted_signals.pop()
 
     except Exception as e:
-        pass # Bỏ qua lỗi nhỏ lẻ để bot chạy liên tục
+        pass 
 
 def job_scanner():
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bắt đầu quét thị trường...")
     
-    # Quét Crypto
     crypto_symbols = get_top_50_binance_futures()
     for sym in crypto_symbols:
         process_symbol(sym, "CRYPTO")
-        time.sleep(0.2) # Nghỉ để tránh bị cấm IP
+        time.sleep(0.2) 
         
-    # Quét Forex
     forex_symbols = get_top_10_forex_pairs()
     for sym in forex_symbols:
         process_symbol(sym, "FOREX")
@@ -273,20 +274,21 @@ def job_scanner():
 # KHỞI ĐỘNG CHƯƠNG TRÌNH
 # ==========================================
 if __name__ == "__main__":
+    # 1. Kích hoạt Server Web chạy song song ở luồng phụ (Tránh lỗi Render)
+    server_thread = Thread(target=run_server)
+    server_thread.start()
+
+    # 2. Bắt đầu luồng chạy Bot chính
     print("🚀 WickZone Signal Bot Python - Khởi Động!")
     send_telegram("🚀 Bot WickZone Python đã khởi động thành công và bắt đầu quét thị trường!")
     
-    # Chạy lần đầu tiên ngay lập tức khi bật file
     job_scanner()
     
-    # Lên lịch chạy kiểm tra sau mỗi khi đóng nến 15 phút (phút 01, 16, 31, 46)
-    # Lùi lại 1 phút để chắc chắn nến M15 của sàn đã đóng cửa hoàn toàn.
     schedule.every().hour.at(":01").do(job_scanner)
     schedule.every().hour.at(":16").do(job_scanner)
     schedule.every().hour.at(":31").do(job_scanner)
     schedule.every().hour.at(":46").do(job_scanner)
 
-    # Vòng lặp giữ cho bot sống mãi mãi
     while True:
         schedule.run_pending()
         time.sleep(1)
