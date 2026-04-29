@@ -9,19 +9,19 @@ from flask import Flask
 from threading import Thread
 
 # ==========================================
-# CẤU HÌNH THÔNG SỐ BẢO MẬT (Lấy từ Environment Variables của Render)
+# CẤU HÌNH THÔNG SỐ BẢO MẬT (Từ Render)
 # ==========================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "8700047218:AAHINxefZHAm_fGMEd3sPJMilNtYH36oSy0")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "7366887130")
 
 # ==========================================
-# CẤU HÌNH MÁY CHỦ WEB MINI (ĐỂ RENDER KHÔNG BÁO LỖI TIMEOUT)
+# CẤU HÌNH MÁY CHỦ WEB MINI (Giữ Render sống)
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def keep_alive():
-    return "Bot Giao Dịch Thuận Xu Hướng (BB + Nến 1H) Đang Hoạt Động!"
+    return "Bot Pullback 40% Khung 4H Đang Hoạt Động!"
 
 def run_server():
     port = int(os.environ.get('PORT', 10000))
@@ -53,13 +53,15 @@ def get_top_50_binance_futures():
         return [x['symbol'] for x in sorted_pairs[:50]]
     except: return []
 
-def get_top_10_forex_pairs():
+def get_forex_and_gold():
+    # Thêm XAUUSD=X (Vàng) vào danh sách
     return ["EURUSD=X", "USDJPY=X", "GBPUSD=X", "USDCHF=X", "AUDUSD=X", 
-            "USDCAD=X", "NZDUSD=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X"]
+            "USDCAD=X", "NZDUSD=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X", "XAUUSD=X"]
 
-def get_binance_klines(symbol, limit=100):
+def get_binance_klines(symbol, limit=20):
     try:
-        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=1h&limit={limit}"
+        # Lấy trực tiếp nến 4H từ Binance
+        url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval=4h&limit={limit}"
         res = requests.get(url).json()
         df = pd.DataFrame(res, columns=['time', 'open', 'high', 'low', 'close', 'vol', 'close_time', 'qav', 'nat', 'tbb', 'tbq', 'ignore'])
         df = df[['time', 'open', 'high', 'low', 'close']].astype(float)
@@ -69,8 +71,17 @@ def get_binance_klines(symbol, limit=100):
 def get_yfinance_klines(symbol, limit=100):
     try:
         ticker = yf.Ticker(symbol)
+        # Lấy nến 1H và gộp thành 4H (Resampling)
         df = ticker.history(interval="1h", period="30d") 
         if df.empty: return pd.DataFrame()
+        
+        df = df.resample('4h').agg({
+            'Open': 'first',
+            'High': 'max',
+            'Low': 'min',
+            'Close': 'last'
+        }).dropna()
+        
         df = df.tail(limit).reset_index()
         time_col = 'Datetime' if 'Datetime' in df.columns else 'Date'
         df.rename(columns={time_col: 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close'}, inplace=True)
@@ -80,88 +91,54 @@ def get_yfinance_klines(symbol, limit=100):
     except: return pd.DataFrame()
 
 # ==========================================
-# 2. THUẬT TOÁN TÌM TÍN HIỆU (NEW)
+# 2. KIỂM TRA MÔ HÌNH NẾN (CORE)
 # ==========================================
-def calculate_indicators(df):
-    # Tính Bollinger Bands (20, 2)
-    df['sma_20'] = df['close'].rolling(window=20).mean()
-    df['std_20'] = df['close'].rolling(window=20).std()
-    df['upper_band'] = df['sma_20'] + (df['std_20'] * 2)
-    df['lower_band'] = df['sma_20'] - (df['std_20'] * 2)
-    return df
-
-def get_trend_24h(df):
-    # Lấy 24 nến gần nhất (trừ nến cuối cùng chưa đóng cửa nếu có)
-    if len(df) < 25: return "SIDEWAYS"
-    df_24 = df.iloc[-25:-1] 
+def check_candlestick_signal(c1, c2, c3):
+    # c1 = Nến 4H đã đóng cửa hoàn toàn
+    # c2 = Nến trước đó
+    # c3 = Nến trước đó nữa (cho mô hình 3 nến)
     
-    # Chia 24 nến làm 2 nửa (12 nến đầu và 12 nến sau) để xác định cấu trúc LL/HH
-    first_half = df_24.iloc[:12]
-    second_half = df_24.iloc[12:]
-    
-    h1, l1 = first_half['high'].max(), first_half['low'].min()
-    h2, l2 = second_half['high'].max(), second_half['low'].min()
-    
-    # Higher High + Higher Low = Uptrend
-    if h2 > h1 and l2 > l1: return "UPTREND"
-    # Lower High + Lower Low = Downtrend
-    elif h2 < h1 and l2 < l1: return "DOWNTREND"
-    else: return "SIDEWAYS"
+    body1 = abs(c1['close'] - c1['open'])
+    lower_wick1 = min(c1['open'], c1['close']) - c1['low']
+    upper_wick1 = c1['high'] - max(c1['open'], c1['close'])
+    total_size1 = c1['high'] - c1['low']
 
-def check_candlestick_signal(df, trend):
-    # c1 = Nến vừa đóng cửa (Tín hiệu)
-    # c2 = Nến ngay trước đó
-    # c3 = Nến trước nữa (dành cho mô hình 3 nến)
-    c1 = df.iloc[-1]
-    c2 = df.iloc[-2]
-    c3 = df.iloc[-3]
-    
-    # --- ĐIỀU KIỆN CHẠM BOLLINGER BANDS ---
-    # Chạm băng Dưới/Giữa: Mức giá thấp nhất của nến phải <= đường SMA20 (Tức là nằm dưới băng giữa hoặc băng dưới)
-    touch_lower_or_mid = (c1['low'] <= c1['sma_20'])
-    # Chạm băng Trên/Giữa: Mức giá cao nhất của nến phải >= đường SMA20 (Tức là nằm trên băng giữa hoặc băng trên)
-    touch_upper_or_mid = (c1['high'] >= c1['sma_20'])
+    if total_size1 <= 0: return None, None
 
-    # --- HÀM KIỂM TRA MÔ HÌNH NẾN ---
-    def is_engulfing(c1, c2, bullish=True):
-        if bullish: return c2['close'] < c2['open'] and c1['close'] > c1['open'] and c1['close'] > c2['open'] and c1['open'] <= c2['close']
-        else: return c2['close'] > c2['open'] and c1['close'] < c1['open'] and c1['close'] < c2['open'] and c1['open'] >= c2['close']
+    # 1. Pinbar / Hammer (Mua)
+    if lower_wick1 >= 2 * body1 and upper_wick1 <= body1 and body1 > 0:
+        return "MUA", "Bullish Pinbar / Hammer"
 
-    def is_pinbar(c, bullish=True):
-        body = abs(c['close'] - c['open'])
-        lower_wick = min(c['open'], c['close']) - c['low']
-        upper_wick = c['high'] - max(c['open'], c['close'])
-        if bullish: return lower_wick >= 2 * body and upper_wick <= body and body > 0 # Hammer
-        else: return upper_wick >= 2 * body and lower_wick <= body and body > 0 # Shooting Star
-        
-    def is_star(c1, c2, c3, morning=True):
-        c2_small = abs(c2['close'] - c2['open']) < abs(c3['close'] - c3['open']) * 0.3 # Nến giữa thân nhỏ
-        if morning:
-            return c3['close'] < c3['open'] and c2_small and c1['close'] > c1['open'] and c1['close'] > (c3['open'] + c3['close']) / 2
-        else:
-            return c3['close'] > c3['open'] and c2_small and c1['close'] < c1['open'] and c1['close'] < (c3['open'] + c3['close']) / 2
+    # 2. Pinbar / Shooting Star (Bán)
+    if upper_wick1 >= 2 * body1 and lower_wick1 <= body1 and body1 > 0:
+        return "BÁN", "Bearish Pinbar / Shooting Star"
 
-    def is_tweezer(c1, c2, bottom=True):
-        if bottom:
-            diff = abs(c1['low'] - c2['low']) / c1['low']
-            return diff < 0.001 and c1['close'] > c1['open'] and c2['close'] < c2['open']
-        else:
-            diff = abs(c1['high'] - c2['high']) / c1['high']
-            return diff < 0.001 and c1['close'] < c1['open'] and c2['close'] > c2['open']
+    # 3. Bullish Engulfing (Mua)
+    if c2['close'] < c2['open'] and c1['close'] > c1['open'] and c1['close'] > c2['open'] and c1['open'] <= c2['close']:
+        return "MUA", "Bullish Engulfing"
 
-    # --- KIỂM TRA KẾT HỢP ---
-    if trend == "UPTREND" and touch_lower_or_mid:
-        if is_engulfing(c1, c2, bullish=True): return "MUA", "Bullish Engulfing"
-        if is_pinbar(c1, bullish=True): return "MUA", "Bullish Pinbar / Hammer"
-        if is_star(c1, c2, c3, morning=True): return "MUA", "Morning Star"
-        if is_tweezer(c1, c2, bottom=True): return "MUA", "Tweezer Bottom"
-        
-    elif trend == "DOWNTREND" and touch_upper_or_mid:
-        if is_engulfing(c1, c2, bullish=False): return "BÁN", "Bearish Engulfing"
-        if is_pinbar(c1, bullish=False): return "BÁN", "Bearish Pinbar / Shooting Star"
-        if is_star(c1, c2, c3, morning=False): return "BÁN", "Evening Star"
-        if is_tweezer(c1, c2, bottom=False): return "BÁN", "Tweezer Top"
-        
+    # 4. Bearish Engulfing (Bán)
+    if c2['close'] > c2['open'] and c1['close'] < c1['open'] and c1['close'] < c2['open'] and c1['open'] >= c2['close']:
+        return "BÁN", "Bearish Engulfing"
+
+    # 5. Morning Star (Mua)
+    c2_body = abs(c2['close'] - c2['open'])
+    c3_body = abs(c3['close'] - c3['open'])
+    if c3['close'] < c3['open'] and c2_body < c3_body * 0.3 and c1['close'] > c1['open'] and c1['close'] > (c3['open'] + c3['close']) / 2:
+        return "MUA", "Morning Star"
+
+    # 6. Evening Star (Bán)
+    if c3['close'] > c3['open'] and c2_body < c3_body * 0.3 and c1['close'] < c1['open'] and c1['close'] < (c3['open'] + c3['close']) / 2:
+        return "BÁN", "Evening Star"
+
+    # 7. Tweezer Bottom (Mua) - Sai số râu dưới 0.1%
+    if abs(c1['low'] - c2['low']) / (c1['low'] + 0.0001) < 0.001 and c1['close'] > c1['open'] and c2['close'] < c2['open']:
+        return "MUA", "Tweezer Bottom"
+
+    # 8. Tweezer Top (Bán) - Sai số râu trên 0.1%
+    if abs(c1['high'] - c2['high']) / (c1['high'] + 0.0001) < 0.001 and c1['close'] < c1['open'] and c2['close'] > c2['open']:
+        return "BÁN", "Tweezer Top"
+
     return None, None
 
 # ==========================================
@@ -169,58 +146,88 @@ def check_candlestick_signal(df, trend):
 # ==========================================
 def process_symbol(symbol, market_type):
     try:
-        # Lấy tối thiểu 50 nến để tính mượt đường Bollinger 20
-        if market_type == "CRYPTO": df = get_binance_klines(symbol, 60)
-        else: df = get_yfinance_klines(symbol, 60)
+        if market_type == "CRYPTO": df = get_binance_klines(symbol, 20)
+        else: df = get_yfinance_klines(symbol, 40)
             
-        if df.empty or len(df) < 30: return
+        if df.empty or len(df) < 5: return
 
-        df = calculate_indicators(df)
-        trend = get_trend_24h(df)
+        # c_live: Cây nến 4H đang chạy (chưa đóng cửa)
+        # c_closed: Cây nến 4H đã đóng cửa hoàn toàn vừa xong
+        c_live = df.iloc[-1]
+        c_closed = df.iloc[-2]
+        c_prev = df.iloc[-3]
+        c_prev2 = df.iloc[-4]
         
-        # Nếu Sideways thì bỏ qua không tìm tín hiệu
-        if trend == "SIDEWAYS": return
-        
-        action, pattern = check_candlestick_signal(df, trend)
+        # Kiểm tra mô hình trên nến H4 đã ĐÓNG CỬA
+        action, pattern = check_candlestick_signal(c_closed, c_prev, c_prev2)
         
         if action and pattern:
-            time_signal = df.iloc[-1]['time']
-            signal_id = f"{symbol}_{time_signal}_{pattern}"
+            # Tính tổng độ dài của nến H4 tín hiệu
+            total_length = c_closed['high'] - c_closed['low']
+            if total_length <= 0: return
             
-            if signal_id not in alerted_signals:
+            signal_time = c_closed['time']
+            signal_id = f"{symbol}_{signal_time}_{pattern}"
+            
+            # Bỏ qua nếu đã báo tin nhắn rồi
+            if signal_id in alerted_signals: return
+            
+            is_triggered = False
+            entry_price = 0
+            
+            # --- KIỂM TRA ĐIỀU KIỆN GIÁ HỒI VỀ 40% ---
+            if action == "MUA":
+                # Canh Mua: Giá phải hồi XUỐNG 40% tính từ đỉnh nến
+                entry_price = c_closed['high'] - (0.40 * total_length)
+                # Kiểm tra nến H4 hiện tại (c_live) đã quét râu/giá xuống mốc này chưa
+                if c_live['low'] <= entry_price:
+                    is_triggered = True
+                    
+            elif action == "BÁN":
+                # Canh Bán: Giá phải hồi LÊN 40% tính từ đáy nến
+                entry_price = c_closed['low'] + (0.40 * total_length)
+                # Kiểm tra nến H4 hiện tại (c_live) đã quét râu/giá lên mốc này chưa
+                if c_live['high'] >= entry_price:
+                    is_triggered = True
+                    
+            # Nếu giá đã quét đúng mốc 40% -> Báo Telegram!
+            if is_triggered:
                 clean_symbol = symbol.replace("=X", "")
                 icon = "🟢" if action == "MUA" else "🔴"
                 msg = (
-                    f"🚨 <b>TÍN HIỆU 1H {market_type}</b>\n\n"
+                    f"🚨 <b>TÍN HIỆU SẾP ƠI {market_type}</b>\n\n"
                     f"Cặp giao dịch: <b>{clean_symbol}</b>\n"
-                    f"Xu hướng (24H): <b>{trend}</b>\n"
+                    f"Chiến lược: Canh hồi nến tín hiệu\n"
                     f"Hành động: {icon} <b>{action}</b>\n"
-                    f"Mô hình: {pattern} chạm Bollinger Bands\n"
-                    f"Giá đóng cửa: {df.iloc[-1]['close']}\n\n"
-                    f"<i>*Vui lòng check chart để xác nhận lại!</i>"
+                    f"Mô hình: {pattern}\n"
+                    f"Giá đóng H4: {c_closed['close']:.5f}\n"
+                    f"Vùng khớp lệnh: <b>{entry_price:.5f}</b>\n\n"
+                    f"✅ <b>Trạng thái:</b> Giá đã chạm vùng ngon cơm!\n"
+                    f"<i>*Hãy mở biểu đồ để xem chi tiết cấu trúc!</i>"
                 )
                 send_telegram(msg)
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Đã báo {clean_symbol} - {pattern}")
                 
+                # Lưu vào bộ nhớ để không báo spam lại
                 alerted_signals.add(signal_id)
                 if len(alerted_signals) > 1000: alerted_signals.pop()
 
     except Exception as e: pass
 
 def job_scanner():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Bắt đầu quét thị trường 1H...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Đang quét theo dõi Pullback 4H...")
     
     crypto_symbols = get_top_50_binance_futures()
     for sym in crypto_symbols:
         process_symbol(sym, "CRYPTO")
         time.sleep(0.2) 
         
-    forex_symbols = get_top_10_forex_pairs()
+    forex_symbols = get_forex_and_gold()
     for sym in forex_symbols:
         process_symbol(sym, "FOREX")
         time.sleep(0.5)
         
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Hoàn thành chu kỳ quét.")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Quét hoàn tất, chờ chu kỳ tiếp theo.")
 
 # ==========================================
 # KHỞI ĐỘNG CHƯƠNG TRÌNH
@@ -230,16 +237,16 @@ if __name__ == "__main__":
     server_thread = Thread(target=run_server)
     server_thread.start()
 
-    # 2. Khởi động thông báo Telegram
-    print("🚀 Bot Trend Following (BB+Nến) - Khởi Động!")
-    send_telegram("🚀 Bot Giao Dịch Thuận Xu Hướng đã khởi động thành công trên Server!")
+    # 2. Khởi động Bot
+    print("🚀 Em Yêu Anh - Khởi Động!")
+    send_telegram("🚀 Vợ đã khởi động thành công!")
     
     # Chạy lần đầu tiên
     job_scanner()
     
-    # Lên lịch quét: CHỈ chạy 1 lần vào PHÚT THỨ 01 của mỗi giờ (VD: 01:01, 02:01, 03:01)
-    # Vì chúng ta đang dùng nến 1H, chạy quét 1 lần/tiếng lúc nến vừa đóng xong là chuẩn xác nhất.
-    schedule.every().hour.at(":01").do(job_scanner)
+    # Lên lịch quét: Chạy 5 PHÚT MỘT LẦN.
+    # Lý do: Ta cần kiểm tra liên tục xem "cây nến 4H đang chạy" đã hồi giá về mốc 40% chưa.
+    schedule.every(5).minutes.do(job_scanner)
 
     while True:
         schedule.run_pending()
